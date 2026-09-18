@@ -253,8 +253,11 @@ function getEventLabel(type: string): string {
 }
 
 onMounted(() => {
-  // Auto-start monitoring on mount
-  store.analyzeECG();
+  // 优先恢复最近一次本地分析（导联、心率设置与结论为同一次快照）；
+  // 没有记录或记录残缺时，按首次打开执行默认分析
+  if (!store.restoreLocalSnapshot()) {
+    store.analyzeECG();
+  }
 });
 
 onUnmounted(() => {

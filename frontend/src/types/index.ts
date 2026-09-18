@@ -41,6 +41,23 @@ export interface ECGAnalysisRequest {
   heartRate: number;
 }
 
+/**
+ * 最近一次本地分析的完整快照：
+ * 导联、心率设置与该次分析产生的波形、指标、事件、结论必须来自同一次运行
+ */
+export interface LocalAnalysisSnapshot {
+  version: 1;
+  savedAt: number;
+  selectedLead: string;
+  heartRate: number;
+  samplingRate: number;
+  duration: number;
+  ecgData: ECGLead;
+  hrvData: HRVData;
+  arrhythmiaEvents: ArrhythmiaEvent[];
+  rhythmDiagnosis: string;
+}
+
 export const LEAD_NAMES: string[] = [
   'I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'
 ];

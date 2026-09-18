@@ -1,6 +1,141 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse, LocalAnalysisSnapshot } from '../types';
+import { LEAD_NAMES } from '../types';
+
+const LOCAL_SNAPSHOT_KEY = 'ecg:local-analysis:last';
+const LOCAL_SNAPSHOT_VERSION = 1;
+
+/**
+ * 持久化最近一次本地分析的完整快照。
+ * 设置（导联、心率）与结论（波形、指标、事件、诊断）一次性整体写入，
+ * 避免新旧结论交错。localStorage 不可用时静默降级为仅内存态。
+ */
+function saveLocalSnapshot(snapshot: LocalAnalysisSnapshot): void {
+  try {
+    localStorage.setItem(LOCAL_SNAPSHOT_KEY, JSON.stringify(snapshot));
+  } catch (error) {
+    console.warn('无法保存本地分析记录:', error);
+  }
+}
+
+function clearLocalSnapshot(): void {
+  try {
+    localStorage.removeItem(LOCAL_SNAPSHOT_KEY);
+  } catch {
+    // localStorage 不可用，忽略
+  }
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isRPeak(value: unknown): value is RPeak {
+  if (typeof value !== 'object' || value === null) return false;
+  const peak = value as Record<string, unknown>;
+  return isFiniteNumber(peak.index) && isFiniteNumber(peak.time) && isFiniteNumber(peak.amplitude);
+}
+
+function isArrhythmiaEvent(value: unknown, validTypes: readonly string[]): value is ArrhythmiaEvent {
+  if (typeof value !== 'object' || value === null) return false;
+  const event = value as Record<string, unknown>;
+  return (
+    typeof event.eventType === 'string' &&
+    validTypes.includes(event.eventType) &&
+    isFiniteNumber(event.confidence) &&
+    typeof event.description === 'string' &&
+    isFiniteNumber(event.timestamp)
+  );
+}
+
+/**
+ * 严格校验本地快照：记录不存在或任何字段残缺时一律视为无效，
+ * 保证恢复后指标区与事件区展示的必然是同一次完整分析。
+ */
+function isValidSnapshot(value: unknown): value is LocalAnalysisSnapshot {
+  if (typeof value !== 'object' || value === null) return false;
+  const snapshot = value as Record<string, unknown>;
+
+  if (snapshot.version !== LOCAL_SNAPSHOT_VERSION) return false;
+  if (!isFiniteNumber(snapshot.savedAt)) return false;
+  if (typeof snapshot.selectedLead !== 'string' || !LEAD_NAMES.includes(snapshot.selectedLead)) return false;
+  if (!isFiniteNumber(snapshot.heartRate) || !isFiniteNumber(snapshot.samplingRate) || !isFiniteNumber(snapshot.duration)) return false;
+  if (typeof snapshot.rhythmDiagnosis !== 'string' || snapshot.rhythmDiagnosis.length === 0) return false;
+
+  const ecg = snapshot.ecgData as Record<string, unknown> | null;
+  if (
+    typeof ecg !== 'object' ||
+    ecg === null ||
+    typeof ecg.leadName !== 'string' ||
+    ecg.leadName !== snapshot.selectedLead ||
+    !isFiniteNumber(ecg.samplingRate) ||
+    ecg.samplingRate !== snapshot.samplingRate ||
+    !isFiniteNumber(ecg.duration) ||
+    ecg.duration !== snapshot.duration ||
+    !Array.isArray(ecg.samples) ||
+    ecg.samples.length === 0 ||
+    !ecg.samples.every(isFiniteNumber) ||
+    !Array.isArray(ecg.rPeaks) ||
+    !ecg.rPeaks.every(isRPeak)
+  ) {
+    return false;
+  }
+
+  // 采样点数需与时长、采样率匹配（容忍 1 个点的取整误差）
+  const expectedSamples = Math.floor(ecg.duration * ecg.samplingRate);
+  if (Math.abs(ecg.samples.length - expectedSamples) > 1) return false;
+
+  const hrv = snapshot.hrvData as Record<string, unknown> | null;
+  if (
+    typeof hrv !== 'object' ||
+    hrv === null ||
+    !isFiniteNumber(hrv.heartRate) ||
+    !isFiniteNumber(hrv.sdnn) ||
+    !isFiniteNumber(hrv.rmssd) ||
+    !isFiniteNumber(hrv.pnn50) ||
+    !Array.isArray(hrv.nnIntervals) ||
+    !hrv.nnIntervals.every(isFiniteNumber)
+  ) {
+    return false;
+  }
+
+  // 本地分析总会产出至少一个事件（含 normal），空数组属于残缺记录
+  const eventTypes = ['normal', 'tachycardia', 'bradycardia', 'st_elevation', 'atrial_fibrillation', 'premature_ventricular_contraction'];
+  return (
+    Array.isArray(snapshot.arrhythmiaEvents) &&
+    snapshot.arrhythmiaEvents.length > 0 &&
+    snapshot.arrhythmiaEvents.every((event) => isArrhythmiaEvent(event, eventTypes))
+  );
+}
+
+/**
+ * 读取并校验最近一次本地分析快照；不存在或内容残缺时返回 null，
+ * 残缺记录会被清除，避免反复尝试恢复坏数据。
+ */
+function loadLocalSnapshot(): LocalAnalysisSnapshot | null {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(LOCAL_SNAPSHOT_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    clearLocalSnapshot();
+    return null;
+  }
+
+  if (!isValidSnapshot(parsed)) {
+    clearLocalSnapshot();
+    return null;
+  }
+  return parsed;
+}
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -104,47 +239,72 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Pan-Tompkins R-peak detection algorithm
-   * Simplified implementation: bandpass -> differentiate -> square -> integrate -> threshold
+   * Pan-Tompkins 风格的 R 波检测
+   * 简化实现：去除基线 -> 自适应阈值 -> 不应期抑制 -> 每拍取局部最高点。
+   * 固定阈值会把 T 波误判成 R 波（心率被估成约 2 倍），因此按预期心动周期
+   * 施加不应期，保证每个周期最多检出一个 R 峰。
    */
   function detectRPeaks(samples: number[], sr: number): RPeak[] {
     const rPeaks: RPeak[] = [];
-    const minDistance = Math.floor(0.2 * sr); // 200ms minimum between peaks
+    if (samples.length === 0) return rPeaks;
 
-    // Simple moving average for baseline
-    const windowSize = Math.floor(0.15 * sr);
-    const threshold = samples.reduce((a, b) => a + b, 0) / samples.length;
+    // 去基线：滑动平均后的残差，凸显 R 峰、压低漂移与 T 波
+    const windowSize = Math.max(1, Math.floor(0.15 * sr));
+    let runningSum = 0;
+    const baseline: number[] = new Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      runningSum += samples[i];
+      if (i >= windowSize) runningSum -= samples[i - windowSize];
+      baseline[i] = runningSum / Math.min(i + 1, windowSize);
+    }
+    const residual = samples.map((s, i) => s - baseline[i]);
+
+    const mean = residual.reduce((a, b) => a + b, 0) / residual.length;
     const stdDev = Math.sqrt(
-      samples.reduce((sum, s) => sum + (s - threshold) ** 2, 0) / samples.length
+      residual.reduce((sum, s) => sum + (s - mean) ** 2, 0) / residual.length
     );
-    const detectionThreshold = threshold + 0.5 * stdDev;
+    // R 峰是最高的正向偏转，阈值取 1.2 倍标准差，低于原实现的 0.5 倍，
+    // 配合不应期可避免 T 波越阈被误检
+    const detectionThreshold = mean + 1.2 * stdDev;
 
-    let lastPeakIndex = -minDistance;
+    // 预期心动周期与不应期（按模拟心率估算，兼容低至 30 BPM）
+    const expectedCycle = 60.0 / heartRate.value;
+    const refractory = Math.floor(0.45 * expectedCycle * sr);
+    const searchRadius = Math.floor(0.05 * sr);
+    const candidates: number[] = [];
 
+    let lastPeakIndex = -refractory;
     for (let i = 1; i < samples.length - 1; i++) {
       if (
-        samples[i] > detectionThreshold &&
-        samples[i] > samples[i - 1] &&
-        samples[i] > samples[i + 1] &&
-        i - lastPeakIndex >= minDistance
+        residual[i] > detectionThreshold &&
+        residual[i] >= residual[i - 1] &&
+        residual[i] >= residual[i + 1] &&
+        i - lastPeakIndex >= refractory
       ) {
-        // Find local maximum in a small window
-        let maxVal = samples[i];
+        // 在小窗口内确认真正的局部最大值
         let maxIdx = i;
-        const searchRadius = Math.floor(0.01 * sr);
-        for (let j = Math.max(0, i - searchRadius); j < Math.min(samples.length, i + searchRadius); j++) {
-          if (samples[j] > maxVal) {
-            maxVal = samples[j];
-            maxIdx = j;
-          }
+        const lo = Math.max(1, i - searchRadius);
+        const hi = Math.min(samples.length - 1, i + searchRadius);
+        for (let j = lo; j <= hi; j++) {
+          if (residual[j] > residual[maxIdx]) maxIdx = j;
         }
+        candidates.push(maxIdx);
+        lastPeakIndex = maxIdx;
+        i = maxIdx;
+      }
+    }
 
-        rPeaks.push({
-          index: maxIdx,
-          time: maxIdx / sr,
-          amplitude: maxVal,
-        });
-        lastPeakIndex = i;
+    // 再按不应期去重，保留幅度更高的候选
+    for (const idx of candidates) {
+      const last = rPeaks[rPeaks.length - 1];
+      if (last && idx - last.index < refractory) {
+        if (residual[idx] > residual[last.index]) {
+          last.index = idx;
+          last.time = idx / sr;
+          last.amplitude = samples[idx];
+        }
+      } else {
+        rPeaks.push({ index: idx, time: idx / sr, amplitude: samples[idx] });
       }
     }
 
@@ -324,6 +484,7 @@ export const useECGStore = defineStore('ecg', () => {
     const hrv = calculateHRV(peaks, lead.samplingRate);
     hrvData.value = hrv;
 
+    // 整屏替换为本次结果，避免上一次的心率过快/过慢结论残留
     const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate);
     arrhythmiaEvents.value = events;
 
@@ -331,6 +492,40 @@ export const useECGStore = defineStore('ecg', () => {
     rhythmDiagnosis.value = isNormal
       ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
       : events.map(e => e.description).join(' | ');
+
+    // 导联、心率设置与本次结论一起整体持久化
+    saveLocalSnapshot({
+      version: LOCAL_SNAPSHOT_VERSION,
+      savedAt: Date.now(),
+      selectedLead: selectedLead.value,
+      heartRate: heartRate.value,
+      samplingRate: samplingRate.value,
+      duration: duration.value,
+      ecgData: lead,
+      hrvData: hrv,
+      arrhythmiaEvents: events,
+      rhythmDiagnosis: rhythmDiagnosis.value,
+    });
+  }
+
+  /**
+   * 恢复最近一次本地分析的完整快照（设置 + 波形 + 指标 + 事件 + 结论）。
+   * 恢复成功返回 true；没有记录或记录残缺时返回 false，由调用方按空状态处理。
+   */
+  function restoreLocalSnapshot(): boolean {
+    const snapshot = loadLocalSnapshot();
+    if (!snapshot) return false;
+
+    selectedLead.value = snapshot.selectedLead;
+    heartRate.value = snapshot.heartRate;
+    samplingRate.value = snapshot.samplingRate;
+    duration.value = snapshot.duration;
+    ecgData.value = snapshot.ecgData;
+    hrvData.value = snapshot.hrvData;
+    arrhythmiaEvents.value = snapshot.arrhythmiaEvents;
+    rhythmDiagnosis.value = snapshot.rhythmDiagnosis;
+    scrollOffset.value = 0;
+    return true;
   }
 
   /**
@@ -401,6 +596,7 @@ export const useECGStore = defineStore('ecg', () => {
     currentHeartRate,
     // Actions
     analyzeECG,
+    restoreLocalSnapshot,
     startMonitoring,
     stopMonitoring,
     selectLead,
