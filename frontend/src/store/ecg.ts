@@ -1,6 +1,133 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse, LocalAnalysisSnapshot } from '../types';
+
+const LOCAL_SNAPSHOT_KEY = 'ecg-monitor:last-local-analysis:v1';
+const LOCAL_SNAPSHOT_VERSION = 1;
+const EVENT_TYPES = [
+  'normal',
+  'tachycardia',
+  'bradycardia',
+  'st_elevation',
+  'atrial_fibrillation',
+  'premature_ventricular_contraction',
+] as const;
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function isRPeak(v: unknown): v is RPeak {
+  const o = v as RPeak;
+  return (
+    !!o &&
+    typeof o === 'object' &&
+    isFiniteNumber(o.index) &&
+    isFiniteNumber(o.time) &&
+    isFiniteNumber(o.amplitude)
+  );
+}
+
+function isECGLead(v: unknown): v is ECGLead {
+  const o = v as ECGLead;
+  return (
+    !!o &&
+    typeof o === 'object' &&
+    typeof o.leadName === 'string' &&
+    o.leadName.length > 0 &&
+    isFiniteNumber(o.samplingRate) && o.samplingRate > 0 &&
+    isFiniteNumber(o.duration) && o.duration > 0 &&
+    Array.isArray(o.samples) && o.samples.length > 0 &&
+    o.samples.every(isFiniteNumber) &&
+    Array.isArray(o.rPeaks) && o.rPeaks.every(isRPeak)
+  );
+}
+
+function isHRVData(v: unknown): v is HRVData {
+  const o = v as HRVData;
+  return (
+    !!o &&
+    typeof o === 'object' &&
+    isFiniteNumber(o.heartRate) &&
+    isFiniteNumber(o.sdnn) &&
+    isFiniteNumber(o.rmssd) &&
+    isFiniteNumber(o.pnn50) &&
+    Array.isArray(o.nnIntervals) && o.nnIntervals.every(isFiniteNumber)
+  );
+}
+
+function isArrhythmiaEvent(v: unknown): v is ArrhythmiaEvent {
+  const o = v as ArrhythmiaEvent;
+  return (
+    !!o &&
+    typeof o === 'object' &&
+    (EVENT_TYPES as readonly string[]).includes(o.eventType) &&
+    isFiniteNumber(o.confidence) &&
+    typeof o.description === 'string' &&
+    isFiniteNumber(o.timestamp)
+  );
+}
+
+/**
+ * 校验快照结构完整：设置与结论、指标、波形必须来自同一次分析，缺一不可。
+ * 字段缺失或类型不符（记录残缺）时返回 false，按空状态处理。
+ */
+function isValidSnapshot(v: unknown): v is LocalAnalysisSnapshot {
+  const o = v as LocalAnalysisSnapshot;
+  if (!o || typeof o !== 'object') return false;
+  if (o.version !== LOCAL_SNAPSHOT_VERSION) return false;
+  if (!isFiniteNumber(o.savedAt)) return false;
+  if (typeof o.selectedLead !== 'string' || o.selectedLead.length === 0) return false;
+  if (!isFiniteNumber(o.heartRate) || o.heartRate <= 0) return false;
+  if (!isFiniteNumber(o.duration) || o.duration <= 0) return false;
+  if (!isFiniteNumber(o.samplingRate) || o.samplingRate <= 0) return false;
+  if (!isECGLead(o.ecgData)) return false;
+  if (!isHRVData(o.hrvData)) return false;
+  if (!Array.isArray(o.arrhythmiaEvents) || o.arrhythmiaEvents.length === 0) return false;
+  if (!o.arrhythmiaEvents.every(isArrhythmiaEvent)) return false;
+  if (typeof o.rhythmDiagnosis !== 'string' || o.rhythmDiagnosis.length === 0) return false;
+  // 跨区一致性：波形与设置必须对得上
+  if (o.ecgData.leadName !== o.selectedLead) return false;
+  if (o.ecgData.samplingRate !== o.samplingRate) return false;
+  if (o.ecgData.duration !== o.duration) return false;
+  return true;
+}
+
+/** 一次性写入整条快照，避免旧的心率过快/过慢结论与新结论混在一起 */
+function persistSnapshot(snapshot: LocalAnalysisSnapshot): void {
+  try {
+    localStorage.setItem(LOCAL_SNAPSHOT_KEY, JSON.stringify(snapshot));
+  } catch (error) {
+    // 存储不可用或配额不足时不影响本次分析结果的展示
+    console.error('Failed to persist local ECG analysis:', error);
+  }
+}
+
+/**
+ * 读取最近一次本地分析快照。
+ * 无记录或记录内容残缺（JSON 损坏、字段缺失、校验失败）时清除坏记录并返回 null。
+ */
+function loadSnapshot(): LocalAnalysisSnapshot | null {
+  try {
+    const raw = localStorage.getItem(LOCAL_SNAPSHOT_KEY);
+    if (!raw) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      localStorage.removeItem(LOCAL_SNAPSHOT_KEY);
+      return null;
+    }
+    if (!isValidSnapshot(parsed)) {
+      localStorage.removeItem(LOCAL_SNAPSHOT_KEY);
+      return null;
+    }
+    return parsed;
+  } catch (error) {
+    console.error('Failed to load local ECG analysis:', error);
+    return null;
+  }
+}
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -331,6 +458,41 @@ export const useECGStore = defineStore('ecg', () => {
     rhythmDiagnosis.value = isNormal
       ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
       : events.map(e => e.description).join(' | ');
+
+    // 本次设置与全部结论、指标、波形作为同一条快照落盘（整屏均为本次结果）
+    persistSnapshot({
+      version: LOCAL_SNAPSHOT_VERSION,
+      savedAt: Date.now(),
+      selectedLead: selectedLead.value,
+      heartRate: heartRate.value,
+      duration: duration.value,
+      samplingRate: samplingRate.value,
+      ecgData: lead,
+      hrvData: hrv,
+      arrhythmiaEvents: events,
+      rhythmDiagnosis: rhythmDiagnosis.value,
+    });
+  }
+
+  /**
+   * 恢复最近一次本地分析：导联、心率设置与结论一起还原，
+   * 指标区（HRV）与事件区（心律失常）展示同一次数据。
+   * 返回 true 表示已恢复；无记录或记录残缺时返回 false，由调用方走默认分析。
+   */
+  function restoreLastAnalysis(): boolean {
+    const snapshot = loadSnapshot();
+    if (!snapshot) return false;
+
+    selectedLead.value = snapshot.selectedLead;
+    heartRate.value = snapshot.heartRate;
+    duration.value = snapshot.duration;
+    samplingRate.value = snapshot.samplingRate;
+    ecgData.value = snapshot.ecgData;
+    hrvData.value = snapshot.hrvData;
+    arrhythmiaEvents.value = snapshot.arrhythmiaEvents;
+    rhythmDiagnosis.value = snapshot.rhythmDiagnosis;
+    scrollOffset.value = 0;
+    return true;
   }
 
   /**
@@ -401,6 +563,7 @@ export const useECGStore = defineStore('ecg', () => {
     currentHeartRate,
     // Actions
     analyzeECG,
+    restoreLastAnalysis,
     startMonitoring,
     stopMonitoring,
     selectLead,
